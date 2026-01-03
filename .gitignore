@@ -1,0 +1,5 @@
+.venv
+dist
+mcp_client.egg-info
+__pycache__
+.env
