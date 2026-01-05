@@ -67,7 +67,7 @@ class MCPClient:
 
         logger.debug(f"Sending request to {url}: {request}")
         response = requests.post(
-            url, json=request, headers=headers, timeout=30
+            url, json=request, headers=headers, timeout=300
         )
 
         logger.debug(f"Response status: {response.status_code}")
