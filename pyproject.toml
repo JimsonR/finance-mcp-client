@@ -10,6 +10,7 @@ dependencies = [
     "click",
     "requests",
     "loguru",
+    "python-dotenv",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
