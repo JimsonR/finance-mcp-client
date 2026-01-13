@@ -1,3 +1,8 @@
 requests
 click
 loguru
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+redis
