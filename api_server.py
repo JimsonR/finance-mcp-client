@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -636,15 +636,34 @@ async def root():
     }
 
 
-@app.get("/health")
+@app.get("/health", include_in_schema=False)
 async def health_check():
-    """Health check endpoint."""
-    client = get_mcp_client()
-    return {
-        "status": "healthy",
-        "mcp_connected": client.initialized,
-        "session_id": client.session_id
-    }
+    """Minimal health check for Render/uptime monitoring. No side effects."""
+    return Response(status_code=200)
+
+
+@app.get("/internal/status")
+async def internal_status():
+    """Internal status endpoint with MCP connection details. NOT for health checks."""
+    try:
+        manager = get_server_manager()
+        servers = manager.get_all_servers_status()
+        
+        # Check if any server is connected
+        connected_servers = [s for s in servers if s["status"] == "connected"]
+        
+        return {
+            "status": "ok",
+            "servers": servers,
+            "connected_count": len(connected_servers),
+            "total_count": len(servers)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "servers": []
+        }
 
 
 @app.get("/servers")
