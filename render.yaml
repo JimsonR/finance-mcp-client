@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: mcp-client-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api_server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
+      - key: MCP_SERVER_URL
+        sync: false  # Set in dashboard
+      - key: MISTRAL_API_KEY
+        sync: false  # Set in dashboard
+      - key: REDIS_URL
+        sync: false  # Optional, for chat history
+      - key: API_HOST
+        value: 0.0.0.0
+      - key: API_PORT
+        fromGroup: web
+    healthCheckPath: /health

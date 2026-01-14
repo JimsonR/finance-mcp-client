@@ -3,3 +3,12 @@ dist
 mcp_client.egg-info
 __pycache__
 .env
+asset_quality_analysis_result.md
+bbox.json
+debt_analysis_result.md
+frontend/
+liquidity_analysis_result.md
+mcp_log.md
+quality_of_earnings_analysis_result.md
+test_with_agent.ipynb
+tests/
