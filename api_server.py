@@ -788,12 +788,20 @@ async def call_tool(request: ToolCallRequest):
     
     try:
         result = manager.call_tool(server_id, request.name, request.arguments)
-        return {
+        
+        # Check if result includes visualization
+        response = {
             "success": True,
             "server_id": server_id,
             "tool": request.name,
             "result": result
         }
+        
+        if isinstance(result, dict) and "visualization" in result:
+            response["result"] = result.get("content")
+            response["visualization"] = result.get("visualization")
+        
+        return response
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
@@ -828,8 +836,16 @@ async def call_tool_stream(request: ToolCallRequest):
             # Call the tool
             result = manager.call_tool(server_id, request.name, request.arguments)
             
+            # Check if result includes visualization
+            if isinstance(result, dict) and "visualization" in result:
+                # Send visualization event
+                yield f"data: {json.dumps({'event': 'visualization', 'visualization': result.get('visualization')})}\n\n"
+                # Send content
+                content = result.get("content")
+                if content:
+                    yield f"data: {json.dumps({'event': 'result', 'content': content})}\n\n"
             # Stream the result
-            if isinstance(result, str):
+            elif isinstance(result, str):
                 # For large results, stream in chunks
                 if len(result) > 1000:
                     chunk_size = 500
@@ -1101,11 +1117,44 @@ class ConversationalAgent:
                     
                     result = self.execute_tool(tool_name, args)
                     
-                    events.append({
-                        "event": "tool_result",
-                        "tool": tool_name,
-                        "result_preview": result[:200] + "..." if len(result) > 200 else result
-                    })
+                    # Check if result contains visualization
+                    if isinstance(result, str):
+                        try:
+                            result_obj = json.loads(result)
+                            if isinstance(result_obj, dict) and "visualization" in result_obj:
+                                # Send visualization as separate event
+                                events.append({
+                                    "event": "visualization",
+                                    "tool": tool_name,
+                                    "visualization": result_obj["visualization"]
+                                })
+                                # Send content separately (no truncation)
+                                events.append({
+                                    "event": "tool_result",
+                                    "tool": tool_name,
+                                    "result": result_obj.get("content", "")
+                                })
+                            else:
+                                # No visualization, send full result
+                                events.append({
+                                    "event": "tool_result",
+                                    "tool": tool_name,
+                                    "result": result
+                                })
+                        except json.JSONDecodeError:
+                            # Not JSON, send as-is
+                            events.append({
+                                "event": "tool_result",
+                                "tool": tool_name,
+                                "result": result
+                            })
+                    else:
+                        # Result is not a string, send as-is
+                        events.append({
+                            "event": "tool_result",
+                            "tool": tool_name,
+                            "result": result
+                        })
                     
                     messages.append({
                         "role": "tool",
@@ -1310,9 +1359,25 @@ async def chat_stream(request: ChatRequest):
                         
                         result = agent.execute_tool(tool_name, args)
                         
-                        # Stream tool result preview
-                        preview = result[:500] + "..." if len(result) > 500 else result
-                        yield f"data: {json.dumps({'event': 'tool_result', 'tool': tool_name, 'result': preview})}\n\n"
+                        # Check if result contains visualization
+                        if isinstance(result, str):
+                            try:
+                                result_obj = json.loads(result)
+                                if isinstance(result_obj, dict) and "visualization" in result_obj:
+                                    # Send visualization as separate event (no truncation)
+                                    yield f"data: {json.dumps({'event': 'visualization', 'tool': tool_name, 'visualization': result_obj['visualization']})}\n\n"
+                                    # Send content separately (no truncation)
+                                    content = result_obj.get("content", "")
+                                    yield f"data: {json.dumps({'event': 'tool_result', 'tool': tool_name, 'result': content})}\n\n"
+                                else:
+                                    # No visualization, send full result (no truncation)
+                                    yield f"data: {json.dumps({'event': 'tool_result', 'tool': tool_name, 'result': result})}\n\n"
+                            except json.JSONDecodeError:
+                                # Not JSON, send as-is (no truncation)
+                                yield f"data: {json.dumps({'event': 'tool_result', 'tool': tool_name, 'result': result})}\n\n"
+                        else:
+                            # Result is not a string, send as-is
+                            yield f"data: {json.dumps({'event': 'tool_result', 'tool': tool_name, 'result': result})}\n\n"
                         
                         messages.append({
                             "role": "tool",

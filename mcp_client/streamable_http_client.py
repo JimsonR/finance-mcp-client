@@ -196,16 +196,27 @@ class MCPStreamableHTTPClient:
 
         result = response.get("result", {})
         content = result.get("content", [])
+        visualization = result.get("visualization")  # NEW: Preserve visualization
         
+        # Extract text content
+        text_content = None
         if content and len(content) > 0:
             text = content[0].get("text", "")
             # Try to parse as JSON
             try:
-                return json.loads(text)
+                text_content = json.loads(text)
             except json.JSONDecodeError:
-                return text
+                text_content = text
         
-        return result
+        # If visualization is present, return structured response
+        if visualization:
+            return {
+                "content": text_content,
+                "visualization": visualization
+            }
+        
+        # Otherwise return just the content (backward compatible)
+        return text_content if text_content is not None else result
 
     def call_tool_streaming(
         self, 
