@@ -15,6 +15,4 @@ services:
         sync: false  # Optional, for chat history
       - key: API_HOST
         value: 0.0.0.0
-      - key: API_PORT
-        fromGroup: web
     healthCheckPath: /health
