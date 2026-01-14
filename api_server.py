@@ -637,8 +637,9 @@ async def root():
 
 
 @app.get("/health", include_in_schema=False)
+@app.head("/health", include_in_schema=False)
 async def health_check():
-    """Minimal health check for Render/uptime monitoring. No side effects."""
+    """Minimal health check for Render/uptime monitoring. Supports both GET and HEAD. No side effects."""
     return Response(status_code=200)
 
 
