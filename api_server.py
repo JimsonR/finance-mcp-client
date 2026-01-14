@@ -1020,7 +1020,7 @@ class ConversationalAgent:
         except Exception as e:
             return json.dumps({"error": str(e)})
     
-    def chat(self, user_prompt: str, max_iterations: int = 10) -> tuple:
+    def chat(self, user_prompt: str, max_iterations: int = 10, messages_history: List[Dict] = None) -> tuple:
         """
         Run conversational chat with tool calling.
         Returns (final_response, events_list) for streaming.
@@ -1034,9 +1034,15 @@ class ConversationalAgent:
                     "use the available tools to fetch real data. Be conversational and helpful. "
                     "After fetching data, provide a clear and insightful summary."
                 )
-            },
-            {"role": "user", "content": user_prompt}
+            }
         ]
+        
+        # Add message history if provided (last 3 messages for context)
+        if messages_history:
+            messages.extend(messages_history)
+        
+        # Add current user prompt
+        messages.append({"role": "user", "content": user_prompt})
         
         events = []
         events.append({"event": "thinking", "message": "Processing your request..."})
@@ -1138,6 +1144,18 @@ async def chat_endpoint(request: ChatRequest):
             chat = manager.create_chat(title)
             chat_id = chat.id
         
+        # Get last 3 messages for context if continuing existing chat
+        messages_history = []
+        if request.chat_id:
+            recent_messages = manager.get_chat_messages(chat_id)
+            # Get last 3 messages (excluding the current one we're about to add)
+            for msg in recent_messages[-3:]:
+                if msg.role in ["user", "assistant"]:
+                    messages_history.append({
+                        "role": msg.role,
+                        "content": msg.content
+                    })
+        
         # Store user message
         now = datetime.utcnow().isoformat() + "Z"
         user_message = ChatMessage(
@@ -1147,8 +1165,8 @@ async def chat_endpoint(request: ChatRequest):
         )
         manager.add_message(chat_id, user_message)
         
-        # Run agent chat
-        response, events = agent.chat(request.prompt, request.max_iterations)
+        # Run agent chat with history
+        response, events = agent.chat(request.prompt, request.max_iterations, messages_history=messages_history)
         
         # Store assistant response
         assistant_message = ChatMessage(
@@ -1210,6 +1228,18 @@ async def chat_stream(request: ChatRequest):
     async def generate():
         final_response = ""
         try:
+            # Get last 3 messages for context if continuing existing chat
+            messages_history = []
+            if request.chat_id:
+                recent_messages = manager.get_chat_messages(chat_id)
+                # Get last 3 messages (excluding the current one we're about to add)
+                for msg in recent_messages[-3:]:
+                    if msg.role in ["user", "assistant"]:
+                        messages_history.append({
+                            "role": msg.role,
+                            "content": msg.content
+                        })
+            
             # Stream events as they happen
             messages = [
                 {
@@ -1219,9 +1249,15 @@ async def chat_stream(request: ChatRequest):
                         "When users ask about stocks, financial data, or market information, "
                         "use the available tools to fetch real data. Be conversational and helpful."
                     )
-                },
-                {"role": "user", "content": request.prompt}
+                }
             ]
+            
+            # Add message history for context
+            if messages_history:
+                messages.extend(messages_history)
+            
+            # Add current user prompt
+            messages.append({"role": "user", "content": request.prompt})
             
             yield f"data: {json.dumps({'event': 'start', 'chat_id': chat_id, 'message': 'Processing your request...'})}\n\n"
             
