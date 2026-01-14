@@ -2,21 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies (if needed for psutil)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install dependencies
+# Install dependencies (using pre-built wheels to avoid gcc requirement)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application
 COPY . .
-
-# Create non-root user for security
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
 
 # Expose port (Apply.build may use PORT env var)
 EXPOSE 8001
