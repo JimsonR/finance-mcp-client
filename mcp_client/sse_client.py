@@ -9,8 +9,9 @@ import queue
 from typing import Dict, Any, Optional, List
 from loguru import logger
 import requests
-
-
+import os
+from dotenv import load_dotenv
+load_dotenv()
 class MCPSSEClient:
     """
     MCP client compatible with SSE transport (used by mcp.run and similar servers).
@@ -22,7 +23,7 @@ class MCPSSEClient:
 
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:8000",
+        base_url: str = os.getenv("MCP_SERVER_URL", "https://yahoo-finance-mcp-yk54.onrender.com"),
         timeout: int = 60,
     ):
         self.base_url = base_url.rstrip("/")

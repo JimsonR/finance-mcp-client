@@ -16,50 +16,292 @@ from dotenv import load_dotenv
 import uvicorn
 
 from mcp_client.sse_client import MCPSSEClient
+from mcp_client.streamable_http_client import MCPStreamableHTTPClient
 from mcp_client.redis_client import get_redis_client
+
+# Type alias for MCP clients
+MCPClientType = MCPSSEClient | MCPStreamableHTTPClient
 
 # Load environment variables
 load_dotenv()
 
 
 # Configuration
-MCP_BASE_URL = os.getenv("MCP_URL", "http://localhost:8000")
+MCP_BASE_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8000")
+MCP_SERVERS_CONFIG = os.getenv("MCP_SERVERS", None)  # JSON array of server configs
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 HOST = os.getenv("API_HOST", "0.0.0.0")
 PORT = int(os.getenv("API_PORT", "8001"))
 
-# Global MCP client instance
+
+# ------------ MCP Server Manager ------------ #
+
+class MCPServerManager:
+    """
+    Manages multiple MCP server connections with session persistence.
+    
+    Supports:
+    - SSE MCP servers (GET /sse + POST /messages) - client_type: "sse"
+    - Streamable HTTP MCP servers (POST /mcp) - client_type: "streamable_http"
+    - Stateful servers (like Playwright) that need session persistence
+    """
+    
+    def __init__(self):
+        self.servers: Dict[str, MCPClientType] = {}
+        self.server_configs: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+    
+    def _load_config_from_env(self):
+        """Load server configurations from environment variables."""
+        if MCP_SERVERS_CONFIG:
+            try:
+                configs = json.loads(MCP_SERVERS_CONFIG)
+                for config in configs:
+                    server_id = config.get("id", str(uuid.uuid4())[:8])
+                    self.server_configs[server_id] = {
+                        "id": server_id,
+                        "url": config.get("url"),
+                        "name": config.get("name", server_id),
+                        "stateful": config.get("stateful", False),  # For Playwright-like servers
+                        "client_type": config.get("client_type", "sse"),  # "sse" or "streamable_http"
+                    }
+                print(f"📋 Loaded {len(self.server_configs)} server configs from MCP_SERVERS")
+            except json.JSONDecodeError as e:
+                print(f"⚠️ Failed to parse MCP_SERVERS: {e}")
+        
+        # Backward compatibility: add MCP_URL as primary server if no configs
+        if not self.server_configs and MCP_BASE_URL:
+            self.server_configs["primary"] = {
+                "id": "primary",
+                "url": MCP_BASE_URL,
+                "name": "Primary MCP Server",
+                "stateful": False,
+                "client_type": "sse",  # Default to SSE for backward compatibility
+            }
+    
+    def add_server(
+        self, 
+        server_id: str, 
+        url: str, 
+        name: str = None, 
+        stateful: bool = False,
+        client_type: str = "sse"
+    ) -> Dict[str, Any]:
+        """
+        Add a new server configuration and optionally connect.
+        
+        Args:
+            server_id: Unique identifier for the server
+            url: Base URL of the MCP server
+            name: Human-readable name (defaults to server_id)
+            stateful: Whether the server needs session persistence
+            client_type: "sse" for standard SSE transport, "streamable_http" for Streamable HTTP
+        """
+        with self._lock:
+            if server_id in self.server_configs:
+                raise ValueError(f"Server '{server_id}' already exists")
+            
+            if client_type not in ("sse", "streamable_http"):
+                raise ValueError(f"Invalid client_type: {client_type}. Must be 'sse' or 'streamable_http'")
+            
+            self.server_configs[server_id] = {
+                "id": server_id,
+                "url": url,
+                "name": name or server_id,
+                "stateful": stateful,
+                "client_type": client_type,
+            }
+            
+            return self.server_configs[server_id]
+    
+    def remove_server(self, server_id: str) -> bool:
+        """Remove a server and disconnect if connected."""
+        with self._lock:
+            if server_id not in self.server_configs:
+                return False
+            
+            # Disconnect if connected
+            if server_id in self.servers:
+                try:
+                    self.servers[server_id].disconnect()
+                except Exception:
+                    pass
+                del self.servers[server_id]
+            
+            del self.server_configs[server_id]
+            return True
+    
+    def get_server(self, server_id: str) -> MCPClientType:
+        """
+        Get an MCP client for a server, connecting if necessary.
+        
+        Creates the appropriate client type based on server configuration:
+        - "sse": MCPSSEClient (GET /sse + POST /messages)
+        - "streamable_http": MCPStreamableHTTPClient (POST /mcp)
+        
+        Maintains session persistence for stateful servers.
+        """
+        with self._lock:
+            if server_id not in self.server_configs:
+                raise ValueError(f"Server '{server_id}' not found")
+            
+            config = self.server_configs[server_id]
+            
+            # Check if already connected and session is valid
+            if server_id in self.servers:
+                client = self.servers[server_id]
+                if client.initialized:
+                    return client
+                # Session lost, need to reconnect
+                print(f"🔄 Reconnecting to {server_id} (session expired)")
+            
+            # Create new connection based on client type
+            client_type = config.get("client_type", "sse")
+            
+            if client_type == "streamable_http":
+                client = MCPStreamableHTTPClient(base_url=config["url"])
+            else:
+                client = MCPSSEClient(base_url=config["url"])
+            
+            if client.connect():
+                self.servers[server_id] = client
+                print(f"✅ Connected to {config['name']} ({server_id}) [{client_type}]")
+                return client
+            else:
+                raise ConnectionError(f"Failed to connect to server '{server_id}' at {config['url']}")
+    
+    def get_all_servers_status(self) -> List[Dict[str, Any]]:
+        """Get status of all configured servers."""
+        servers = []
+        for server_id, config in self.server_configs.items():
+            status = {
+                "id": server_id,
+                "name": config.get("name", server_id),
+                "url": config.get("url"),
+                "stateful": config.get("stateful", False),
+                "client_type": config.get("client_type", "sse"),
+                "status": "disconnected",
+                "session_id": None,
+                "capabilities": {"tools": 0, "resources": 0}
+            }
+            
+            if server_id in self.servers:
+                client = self.servers[server_id]
+                if client.initialized:
+                    status["status"] = "connected"
+                    status["session_id"] = client.session_id
+                    try:
+                        status["capabilities"]["tools"] = len(client.list_tools())
+                    except Exception:
+                        pass
+                    try:
+                        status["capabilities"]["resources"] = len(client.list_resources())
+                    except Exception:
+                        pass
+            
+            servers.append(status)
+        
+        return servers
+    
+    def get_all_tools(self, server_id: str = None) -> List[Dict[str, Any]]:
+        """Get tools from all servers or a specific server, including server_id in each tool."""
+        all_tools = []
+        
+        target_servers = [server_id] if server_id else list(self.server_configs.keys())
+        
+        for sid in target_servers:
+            try:
+                client = self.get_server(sid)
+                tools = client.list_tools()
+                for tool in tools:
+                    tool["server_id"] = sid
+                    tool["server_name"] = self.server_configs[sid].get("name", sid)
+                all_tools.extend(tools)
+            except Exception as e:
+                print(f"⚠️ Failed to get tools from {sid}: {e}")
+        
+        return all_tools
+    
+    def get_all_resources(self, server_id: str = None) -> List[Dict[str, Any]]:
+        """Get resources from all servers or a specific server."""
+        all_resources = []
+        
+        target_servers = [server_id] if server_id else list(self.server_configs.keys())
+        
+        for sid in target_servers:
+            try:
+                client = self.get_server(sid)
+                resources = client.list_resources()
+                for resource in resources:
+                    resource["server_id"] = sid
+                    resource["server_name"] = self.server_configs[sid].get("name", sid)
+                all_resources.extend(resources)
+            except Exception as e:
+                print(f"⚠️ Failed to get resources from {sid}: {e}")
+        
+        return all_resources
+    
+    def call_tool(self, server_id: str, tool_name: str, arguments: Dict[str, Any]) -> Any:
+        """Call a tool on a specific server, maintaining session for stateful servers."""
+        client = self.get_server(server_id)
+        return client.call_tool(tool_name, arguments)
+    
+    def connect_all(self):
+        """Connect to all configured servers."""
+        for server_id in self.server_configs:
+            try:
+                self.get_server(server_id)
+            except Exception as e:
+                print(f"⚠️ Failed to connect to {server_id}: {e}")
+    
+    def disconnect_all(self):
+        """Disconnect from all servers."""
+        for server_id, client in list(self.servers.items()):
+            try:
+                client.disconnect()
+                print(f"🔌 Disconnected from {server_id}")
+            except Exception:
+                pass
+        self.servers.clear()
+
+
+# Import threading for lock
+import threading
+
+# Global server manager instance
+server_manager: Optional[MCPServerManager] = None
+
+# Legacy global for backward compatibility
 mcp_client: Optional[MCPSSEClient] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage MCP client connection on startup/shutdown."""
-    global mcp_client
+    """Manage MCP server connections on startup/shutdown."""
+    global server_manager, mcp_client
     
     print(f"🚀 Starting API server...")
-    print(f"📡 MCP Server URL: {MCP_BASE_URL}")
     
-    # Try to connect to MCP server, but don't fail if unavailable
-    mcp_client = MCPSSEClient(base_url=MCP_BASE_URL)
+    # Initialize server manager
+    server_manager = MCPServerManager()
+    server_manager._load_config_from_env()
     
-    try:
-        if mcp_client.connect():
-            tools = mcp_client.list_tools()
-            print(f"✅ Connected to MCP server. Found {len(tools)} tools.")
-        else:
-            print(f"⚠️ MCP server not available at {MCP_BASE_URL}. Will retry on first request.")
-            mcp_client = None
-    except Exception as e:
-        print(f"⚠️ Could not connect to MCP server: {e}. Will retry on first request.")
-        mcp_client = None
+    print(f"📋 Configured servers: {list(server_manager.server_configs.keys())}")
+    
+    # Try to connect to all configured servers
+    server_manager.connect_all()
+    
+    # Set legacy mcp_client for backward compatibility
+    if "primary" in server_manager.servers:
+        mcp_client = server_manager.servers["primary"]
+    elif server_manager.servers:
+        mcp_client = next(iter(server_manager.servers.values()))
     
     yield
     
     # Cleanup
-    if mcp_client:
-        mcp_client.disconnect()
-        print("🔌 Disconnected from MCP server")
+    server_manager.disconnect_all()
+    print("🔌 Disconnected from all MCP servers")
 
 
 
@@ -87,6 +329,16 @@ class ToolCallRequest(BaseModel):
     """Request model for calling a tool."""
     name: str
     arguments: Dict[str, Any] = {}
+    server_id: Optional[str] = None  # Target server, uses first available if not specified
+
+
+class AddServerRequest(BaseModel):
+    """Request model for adding a new MCP server."""
+    id: str
+    url: str
+    name: Optional[str] = None
+    stateful: bool = False  # Set True for servers like Playwright that need session persistence
+    client_type: str = "sse"  # "sse" for standard SSE transport, "streamable_http" for HTTP POST /mcp
 
 
 class ChatRequest(BaseModel):
@@ -300,24 +552,48 @@ def get_chat_manager() -> ChatManager:
 
 # ------------ Helper Functions ------------ #
 
-def get_mcp_client() -> MCPSSEClient:
-    """Get the MCP client instance, attempting to connect if not already connected."""
+def get_server_manager() -> MCPServerManager:
+    """Get the server manager instance."""
+    global server_manager
+    if server_manager is None:
+        server_manager = MCPServerManager()
+        server_manager._load_config_from_env()
+    return server_manager
+
+
+def get_mcp_client(server_id: str = None) -> MCPSSEClient:
+    """
+    Get an MCP client instance for a specific server or the primary server.
+    Maintains backward compatibility with single-server usage.
+    """
     global mcp_client
     
-    if mcp_client is None:
-        # Try to connect now
-        mcp_client = MCPSSEClient(base_url=MCP_BASE_URL)
-        if not mcp_client.connect():
-            mcp_client = None
-            raise HTTPException(
-                status_code=503, 
-                detail=f"MCP server not available at {MCP_BASE_URL}. Please ensure it's running."
-            )
+    manager = get_server_manager()
     
-    if not mcp_client.initialized:
-        raise HTTPException(status_code=503, detail="MCP client not initialized")
+    if server_id:
+        # Get specific server
+        try:
+            return manager.get_server(server_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail=f"Server '{server_id}' not found")
+        except ConnectionError as e:
+            raise HTTPException(status_code=503, detail=str(e))
     
-    return mcp_client
+    # Use legacy mcp_client or first available server
+    if mcp_client and mcp_client.initialized:
+        return mcp_client
+    
+    # Try to get primary or first available
+    if manager.server_configs:
+        first_id = "primary" if "primary" in manager.server_configs else next(iter(manager.server_configs.keys()))
+        try:
+            client = manager.get_server(first_id)
+            mcp_client = client  # Update legacy reference
+            return client
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"No MCP server available: {e}")
+    
+    raise HTTPException(status_code=503, detail="No MCP servers configured")
 
 
 def convert_mcp_tools_to_mistral(mcp_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -374,59 +650,74 @@ async def health_check():
 @app.get("/servers")
 async def list_servers():
     """List all available MCP servers and their status."""
-    servers = []
-    
-    # Primary MCP server
-    server_info = {
-        "name": "primary",
-        "url": MCP_BASE_URL,
-        "status": "unknown",
-        "session_id": None,
-        "capabilities": {
-            "tools": 0,
-            "resources": 0
-        }
-    }
-    
-    try:
-        client = get_mcp_client()
-        if client and client.initialized:
-            server_info["status"] = "connected"
-            server_info["session_id"] = client.session_id
-            
-            # Get capabilities
-            try:
-                tools = client.list_tools()
-                server_info["capabilities"]["tools"] = len(tools)
-            except Exception:
-                pass
-            
-            try:
-                resources = client.list_resources()
-                server_info["capabilities"]["resources"] = len(resources)
-            except Exception:
-                pass
-        else:
-            server_info["status"] = "disconnected"
-    except HTTPException:
-        server_info["status"] = "unavailable"
-    except Exception as e:
-        server_info["status"] = "error"
-        server_info["error"] = str(e)
-    
-    servers.append(server_info)
-    
+    manager = get_server_manager()
+    servers = manager.get_all_servers_status()
     return {
         "count": len(servers),
         "servers": servers
     }
 
 
+@app.post("/servers")
+async def add_server(request: AddServerRequest):
+    """
+    Add a new MCP server at runtime.
+    
+    Args:
+        id: Unique server identifier
+        url: Base URL of the MCP server
+        name: Display name (optional)
+        stateful: Set True for servers like Playwright that need session persistence
+        client_type: "sse" for standard SSE transport, "streamable_http" for HTTP POST /mcp
+    """
+    manager = get_server_manager()
+    
+    try:
+        server = manager.add_server(
+            server_id=request.id,
+            url=request.url,
+            name=request.name,
+            stateful=request.stateful,
+            client_type=request.client_type
+        )
+        
+        # Try to connect immediately
+        try:
+            manager.get_server(request.id)
+            server["status"] = "connected"
+        except Exception as e:
+            server["status"] = "connection_failed"
+            server["error"] = str(e)
+        
+        return {
+            "success": True,
+            "server": server
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/servers/{server_id}")
+async def remove_server(server_id: str):
+    """Remove an MCP server and disconnect if connected."""
+    manager = get_server_manager()
+    
+    if manager.remove_server(server_id):
+        return {"success": True, "message": f"Server '{server_id}' removed"}
+    else:
+        raise HTTPException(status_code=404, detail=f"Server '{server_id}' not found")
+
+
 @app.get("/tools")
-async def list_tools():
-    """List all available MCP tools."""
-    client = get_mcp_client()
-    tools = client.list_tools()
+async def list_tools(server_id: Optional[str] = Query(None, description="Filter by server ID")):
+    """
+    List all available MCP tools.
+    
+    If server_id is provided, returns tools from that server only.
+    Otherwise returns tools from all connected servers.
+    """
+    manager = get_server_manager()
+    tools = manager.get_all_tools(server_id)
     return {
         "count": len(tools),
         "tools": tools
@@ -434,10 +725,10 @@ async def list_tools():
 
 
 @app.get("/tools/mistral")
-async def list_tools_mistral_format():
+async def list_tools_mistral_format(server_id: Optional[str] = Query(None)):
     """List all MCP tools in Mistral function-calling format."""
-    client = get_mcp_client()
-    tools = client.list_tools()
+    manager = get_server_manager()
+    tools = manager.get_all_tools(server_id)
     mistral_tools = convert_mcp_tools_to_mistral(tools)
     return {
         "count": len(mistral_tools),
@@ -447,16 +738,44 @@ async def list_tools_mistral_format():
 
 @app.post("/tools/call")
 async def call_tool(request: ToolCallRequest):
-    """Call a specific MCP tool."""
-    client = get_mcp_client()
+    """
+    Call a specific MCP tool.
+    
+    If server_id is provided, routes to that server.
+    Otherwise uses primary/first available server.
+    """
+    manager = get_server_manager()
+    
+    # Determine which server to use
+    server_id = request.server_id
+    if not server_id:
+        # Find server with this tool
+        for sid, config in manager.server_configs.items():
+            try:
+                client = manager.get_server(sid)
+                tools = client.list_tools()
+                if any(t.get("name") == request.name for t in tools):
+                    server_id = sid
+                    break
+            except Exception:
+                continue
+    
+    if not server_id:
+        server_id = "primary" if "primary" in manager.server_configs else next(iter(manager.server_configs.keys()), None)
+    
+    if not server_id:
+        raise HTTPException(status_code=503, detail="No MCP servers available")
     
     try:
-        result = client.call_tool(request.name, request.arguments)
+        result = manager.call_tool(server_id, request.name, request.arguments)
         return {
             "success": True,
+            "server_id": server_id,
             "tool": request.name,
             "result": result
         }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -468,15 +787,26 @@ async def call_tool_stream(request: ToolCallRequest):
     """Call a specific MCP tool with streaming response (SSE)."""
     import asyncio
     
-    client = get_mcp_client()
+    manager = get_server_manager()
+    
+    # Determine which server to use
+    server_id = request.server_id
+    if not server_id:
+        server_id = "primary" if "primary" in manager.server_configs else next(iter(manager.server_configs.keys()), None)
+    
+    if not server_id:
+        return StreamingResponse(
+            iter([f"data: {json.dumps({'event': 'error', 'message': 'No MCP servers available'})}\n\n"]),
+            media_type="text/event-stream"
+        )
     
     async def generate():
         try:
             # Send start event
-            yield f"data: {json.dumps({'event': 'start', 'tool': request.name, 'status': 'processing'})}\n\n"
+            yield f"data: {json.dumps({'event': 'start', 'tool': request.name, 'server_id': server_id, 'status': 'processing'})}\n\n"
             
             # Call the tool
-            result = client.call_tool(request.name, request.arguments)
+            result = manager.call_tool(server_id, request.name, request.arguments)
             
             # Stream the result
             if isinstance(result, str):
@@ -512,23 +842,24 @@ async def call_tool_stream(request: ToolCallRequest):
 
 
 @app.get("/resources")
-async def list_resources():
-    """List all available MCP resources."""
-    client = get_mcp_client()
-    try:
-        resources = client.list_resources()
-        return {
-            "count": len(resources),
-            "resources": resources
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def list_resources(server_id: Optional[str] = Query(None, description="Filter by server ID")):
+    """
+    List all available MCP resources.
+    
+    If server_id is provided, returns resources from that server only.
+    """
+    manager = get_server_manager()
+    resources = manager.get_all_resources(server_id)
+    return {
+        "count": len(resources),
+        "resources": resources
+    }
 
 
 @app.get("/resources/{uri:path}")
-async def read_resource(uri: str):
+async def read_resource(uri: str, server_id: Optional[str] = Query(None)):
     """Read a specific MCP resource."""
-    client = get_mcp_client()
+    client = get_mcp_client(server_id)
     try:
         result = client.read_resource(uri)
         return {
@@ -536,6 +867,7 @@ async def read_resource(uri: str):
             "content": result
         }
     except RuntimeError as e:
+
         raise HTTPException(status_code=404, detail=str(e))
 
 
