@@ -48,6 +48,7 @@ class MCPStreamableHTTPClient:
         self.base_url = normalized_url.rstrip("/")
         self.mcp_path = "/" + mcp_path.strip("/") if mcp_path else "/mcp"
         self.session_id = session_id or f"client-{uuid.uuid4().hex[:8]}"
+        self.mcp_session_id: Optional[str] = None   # Set by server after initialize (mcp-session-id header)
         self.timeout = timeout
         self.request_id = 0
         self.initialized = False
@@ -61,11 +62,15 @@ class MCPStreamableHTTPClient:
 
     def _get_headers(self) -> Dict[str, str]:
         """Get standard headers for requests."""
-        return {
+        headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
             "X-Session-ID": self.session_id,
         }
+        # Include the server-assigned MCP session ID if we have one (required by FastMCP)
+        if self.mcp_session_id:
+            headers["mcp-session-id"] = self.mcp_session_id
+        return headers
 
     def _send_request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
@@ -110,6 +115,12 @@ class MCPStreamableHTTPClient:
                 raise RuntimeError(f"Request failed with status {response.status_code}: {response.text}")
 
             content_type = response.headers.get("Content-Type", "")
+
+            # Capture the server-assigned session ID (FastMCP) if present
+            server_sid = response.headers.get("mcp-session-id")
+            if server_sid:
+                self.mcp_session_id = server_sid
+                logger.debug(f"Captured mcp-session-id: {server_sid}")
 
             if "text/event-stream" in content_type:
                 # Server responded with an SSE stream — extract first JSON-RPC message
