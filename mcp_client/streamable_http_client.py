@@ -159,6 +159,34 @@ class MCPStreamableHTTPClient:
                     continue
         raise RuntimeError("SSE stream ended without a JSON-RPC response message")
 
+    def _send_notification(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Send a JSON-RPC 2.0 notification (fire-and-forget, no id, no response expected).
+
+        Used for lifecycle notifications like notifications/initialized.
+        Per spec, the server MUST NOT reply to notifications.
+        """
+        url = f"{self.base_url}{self.mcp_path}"
+        notification = {
+            "jsonrpc": "2.0",
+            "method": method,
+        }
+        if params:
+            notification["params"] = params
+
+        try:
+            response = self._session.post(
+                url,
+                json=notification,
+                headers=self._get_headers(),
+                timeout=self.timeout,
+            )
+            # 200 or 202 are both fine; body should be empty for notifications
+            logger.debug(f"Notification '{method}' sent, status: {response.status_code}")
+        except Exception as e:
+            # Non-fatal — log and continue
+            logger.debug(f"Notification '{method}' failed silently: {e}")
+
     def connect(self) -> bool:
         """
         Initialize connection with the MCP server.
@@ -191,7 +219,11 @@ class MCPStreamableHTTPClient:
 
             self.server_info = response.get("result", {})
             logger.info(f"Server capabilities: {self.server_info.get('capabilities', {})}")
-            
+
+            # MCP spec requires sending notifications/initialized after the handshake.
+            # This is a notification (no id, no response expected).
+            self._send_notification("notifications/initialized", {})
+
             self.initialized = True
             logger.info(f"MCP Streamable HTTP client connected to {self.base_url}")
             return True
