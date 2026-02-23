@@ -42,9 +42,11 @@ class MCPStreamableHTTPClient:
         base_url: str = os.getenv("MCP_SERVER_URL", "http://localhost:8080"),
         session_id: str = None,
         timeout: int = 60,
+        mcp_path: str = "/mcp",
     ):
         normalized_url = (base_url or "").strip().strip('"').strip("'")
         self.base_url = normalized_url.rstrip("/")
+        self.mcp_path = "/" + mcp_path.strip("/") if mcp_path else "/mcp"
         self.session_id = session_id or f"client-{uuid.uuid4().hex[:8]}"
         self.timeout = timeout
         self.request_id = 0
@@ -68,54 +70,94 @@ class MCPStreamableHTTPClient:
     def _send_request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Send a JSON-RPC 2.0 request to the /mcp endpoint.
-        
+
+        Handles both response formats allowed by the MCP Streamable HTTP spec:
+        - application/json  → parse body directly as JSON-RPC response
+        - text/event-stream → read SSE stream and extract first JSON-RPC message
+
         Args:
             method: The JSON-RPC method name
             params: Optional parameters for the method
-            
+
         Returns:
             The JSON-RPC response as a dictionary
         """
-        url = f"{self.base_url}/mcp"
-        
+        url = f"{self.base_url}{self.mcp_path}"
+
         request = {
             "jsonrpc": "2.0",
             "id": self.get_next_id(),
             "method": method,
         }
-        
+
         if params:
             request["params"] = params
 
         logger.debug(f"Sending request to {url}: {method}")
-        
+
         try:
             response = self._session.post(
                 url,
                 json=request,
                 headers=self._get_headers(),
                 timeout=self.timeout,
+                stream=True,  # Always stream so we can handle SSE responses
             )
-            
+
             logger.debug(f"Response status: {response.status_code}")
-            
+
             if response.status_code not in (200, 202):
                 raise RuntimeError(f"Request failed with status {response.status_code}: {response.text}")
-            
-            result = response.json()
-            
+
+            content_type = response.headers.get("Content-Type", "")
+
+            if "text/event-stream" in content_type:
+                # Server responded with an SSE stream — extract first JSON-RPC message
+                result = self._parse_sse_response(response)
+            else:
+                # Plain JSON response
+                result = response.json()
+
             if "error" in result:
                 error = result["error"]
                 raise RuntimeError(f"JSON-RPC error [{error.get('code')}]: {error.get('message')}")
-            
+
             return result
-            
+
         except requests.exceptions.Timeout:
             raise TimeoutError(f"Request to {url} timed out after {self.timeout}s")
         except requests.exceptions.ConnectionError as e:
             raise ConnectionError(f"Failed to connect to {url}: {e}")
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Invalid JSON response: {e}")
+
+    def _parse_sse_response(self, response) -> Dict[str, Any]:
+        """
+        Parse a server-sent events (SSE) response and return the first JSON-RPC message.
+
+        The MCP spec allows servers to respond to POST /mcp with an SSE stream.
+        Each SSE event carries a JSON-RPC response or notification on the 'data:' line.
+        We read until we find a message with an 'id' (i.e., a response, not a notification).
+        """
+        data_lines: list = []
+        for raw_line in response.iter_lines(decode_unicode=True):
+            line = raw_line.strip() if raw_line else ""
+            if line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+            elif line == "" and data_lines:
+                # End of one SSE event — try to parse it
+                data_str = "\n".join(data_lines)
+                data_lines = []
+                if not data_str:
+                    continue
+                try:
+                    msg = json.loads(data_str)
+                    # Return on response messages (have an id), skip notifications
+                    if "id" in msg:
+                        return msg
+                except json.JSONDecodeError:
+                    continue
+        raise RuntimeError("SSE stream ended without a JSON-RPC response message")
 
     def connect(self) -> bool:
         """
@@ -245,7 +287,7 @@ class MCPStreamableHTTPClient:
         if not self.initialized:
             raise RuntimeError("Client not initialized - call connect() first")
 
-        url = f"{self.base_url}/mcp/stream"
+        url = f"{self.base_url}{self.mcp_path}/stream"
         
         request = {
             "jsonrpc": "2.0",
@@ -345,7 +387,7 @@ class MCPStreamableHTTPClient:
         if not self.initialized:
             raise RuntimeError("Client not initialized - call connect() first")
 
-        url = f"{self.base_url}/mcp"
+        url = f"{self.base_url}{self.mcp_path}"
         
         batch = []
         for req in requests_list:

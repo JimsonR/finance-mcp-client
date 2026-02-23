@@ -64,6 +64,7 @@ class MCPServerManager:
                         "name": config.get("name", server_id),
                         "stateful": config.get("stateful", False),  # For Playwright-like servers
                         "client_type": config.get("client_type", "sse"),  # "sse" or "streamable_http"
+                        "mcp_path": config.get("mcp_path", "/mcp"),  # MCP endpoint path
                     }
                 print(f"📋 Loaded {len(self.server_configs)} server configs from MCP_SERVERS")
             except json.JSONDecodeError as e:
@@ -110,6 +111,7 @@ class MCPServerManager:
                 "name": name or server_id,
                 "stateful": stateful,
                 "client_type": client_type,
+                "mcp_path": "/mcp",
             }
             
             return self.server_configs[server_id]
@@ -159,7 +161,10 @@ class MCPServerManager:
             client_type = config.get("client_type", "sse")
             
             if client_type == "streamable_http":
-                client = MCPStreamableHTTPClient(base_url=config["url"])
+                client = MCPStreamableHTTPClient(
+                    base_url=config["url"],
+                    mcp_path=config.get("mcp_path", "/mcp"),
+                )
             else:
                 client = MCPSSEClient(base_url=config["url"])
             
