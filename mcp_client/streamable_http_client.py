@@ -43,12 +43,15 @@ class MCPStreamableHTTPClient:
         session_id: str = None,
         timeout: int = 60,
     ):
-        self.base_url = base_url.rstrip("/")
+        normalized_url = (base_url or "").strip().strip('"').strip("'")
+        self.base_url = normalized_url.rstrip("/")
         self.session_id = session_id or f"client-{uuid.uuid4().hex[:8]}"
         self.timeout = timeout
         self.request_id = 0
         self.initialized = False
         self.server_info: Optional[Dict[str, Any]] = None
+        self._session = requests.Session()
+        self._session.trust_env = False
 
     def get_next_id(self) -> int:
         self.request_id += 1
@@ -58,6 +61,7 @@ class MCPStreamableHTTPClient:
         """Get standard headers for requests."""
         return {
             "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
             "X-Session-ID": self.session_id,
         }
 
@@ -86,7 +90,7 @@ class MCPStreamableHTTPClient:
         logger.debug(f"Sending request to {url}: {method}")
         
         try:
-            response = requests.post(
+            response = self._session.post(
                 url,
                 json=request,
                 headers=self._get_headers(),
@@ -124,7 +128,7 @@ class MCPStreamableHTTPClient:
             # Check health first (optional)
             try:
                 health_url = f"{self.base_url}/health"
-                health_response = requests.get(health_url, timeout=10)
+                health_response = self._session.get(health_url, timeout=10)
                 if health_response.status_code == 200:
                     logger.info(f"Server health check passed: {health_response.json()}")
             except Exception as e:
@@ -162,6 +166,7 @@ class MCPStreamableHTTPClient:
         """
         self.initialized = False
         self.server_info = None
+        self._session.close()
         logger.info("MCP Streamable HTTP client disconnected")
 
     def list_tools(self) -> List[Dict[str, Any]]:
@@ -255,7 +260,7 @@ class MCPStreamableHTTPClient:
         logger.debug(f"Starting streaming request to {url} for tool: {name}")
         
         try:
-            response = requests.post(
+            response = self._session.post(
                 url,
                 json=request,
                 headers=self._get_headers(),
@@ -353,7 +358,7 @@ class MCPStreamableHTTPClient:
 
         logger.debug(f"Sending batch request with {len(batch)} items")
         
-        response = requests.post(
+        response = self._session.post(
             url,
             json=batch,
             headers=self._get_headers(),
