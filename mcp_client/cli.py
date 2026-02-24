@@ -2,10 +2,12 @@ import json
 import os
 import click
 import requests
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from loguru import logger
 
 from .client import MCPClient
+from .streamable_http_client import MCPStreamableHTTPClient
 
 
 @click.group()
@@ -204,8 +206,17 @@ def mistral_chat(prompt, model, max_tokens, temperature, mcp_url, tool_choice, d
         "Content-Type": "application/json",
     }
 
-    # Discover tools from MCP server and expose them to Mistral.
-    mcp_client = MCPClient(transport_mode="http", url=mcp_url)
+    # ---- Connect to MCP server using StreamableHTTP client ----
+    # Parse the MCP URL into base_url + mcp_path for MCPStreamableHTTPClient
+    parsed = urlparse(mcp_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    mcp_path = parsed.path or "/mcp"
+
+    mcp_client = MCPStreamableHTTPClient(
+        base_url=base_url,
+        mcp_path=mcp_path,
+        timeout=120,
+    )
     if not mcp_client.connect():
         raise click.ClickException(f"Failed to connect to MCP server at {mcp_url}.")
 
@@ -238,7 +249,15 @@ def mistral_chat(prompt, model, max_tokens, temperature, mcp_url, tool_choice, d
         )
 
     def call_tool(name, arguments):
-        return mcp_client.call_tool(name, arguments or {})
+        result = mcp_client.call_tool(name, arguments or {})
+        # MCPStreamableHTTPClient may return dict (with visualization) or str
+        if isinstance(result, dict):
+            # If it has content, extract it; otherwise JSON-encode the whole thing
+            content = result.get("content")
+            if content is not None:
+                return content if isinstance(content, str) else json.dumps(content)
+            return json.dumps(result)
+        return result if isinstance(result, str) else json.dumps(result)
 
     if tool_choice not in ("auto", "none"):
         resolved_tool_choice = {
@@ -259,13 +278,19 @@ def mistral_chat(prompt, model, max_tokens, temperature, mcp_url, tool_choice, d
             "content": (
                 "You have access to tools exposed by an MCP server. "
                 "If the user asks for live/external information (like IP address), call an appropriate tool "
-                "instead of explaining how to do it."
+                "instead of explaining how to do it.\n\n"
+                "IMPORTANT: For data/SQL questions you MUST follow this two-step workflow:\n"
+                "1. First call get_sql_schema to discover the relevant tables and columns.\n"
+                "2. Then call run_sql_query with a SQL query built from that schema to get the actual data.\n"
+                "Never stop after just getting the schema — always follow up with run_sql_query to answer the user's question.\n"
+                "If the schema result is missing tables you need (e.g. customers, orders), call get_sql_schema again "
+                "with different search_terms that include the missing table names."
             ),
         },
         {"role": "user", "content": prompt},
     ]
 
-    for _ in range(3):  # allow a couple of tool-call rounds
+    for round_num in range(10):  # allow up to 10 tool-call rounds
         payload = {
             "model": model,
             "messages": messages,
@@ -275,7 +300,11 @@ def mistral_chat(prompt, model, max_tokens, temperature, mcp_url, tool_choice, d
             "temperature": temperature,
         }
 
-        response = requests.post(url, json=payload, headers=headers, timeout=60)
+        if debug:
+            logger.debug(f"--- Round {round_num + 1} ---")
+            logger.debug(f"Messages count: {len(messages)}")
+
+        response = requests.post(url, json=payload, headers=headers, timeout=120)
         response.raise_for_status()
         data = response.json()
 
@@ -295,6 +324,17 @@ def mistral_chat(prompt, model, max_tokens, temperature, mcp_url, tool_choice, d
         tool_calls = message.get("tool_calls") or []
         if tool_calls:
             logger.info(f"Mistral requested {len(tool_calls)} tool call(s)")
+
+            # Append the FULL assistant message once (with content + all tool_calls)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.get("content") or "",
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            # Execute each tool and append results
             for tc in tool_calls:
                 fn = tc.get("function", {})
                 name = fn.get("name")
@@ -319,13 +359,8 @@ def mistral_chat(prompt, model, max_tokens, temperature, mcp_url, tool_choice, d
 
                 messages.append(
                     {
-                        "role": "assistant",
-                        "tool_calls": [tc],
-                    }
-                )
-                messages.append(
-                    {
                         "role": "tool",
+                        "name": name,
                         "tool_call_id": tc.get("id"),
                         "content": result if isinstance(result, str) else json.dumps(result),
                     }
