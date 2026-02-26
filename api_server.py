@@ -714,6 +714,10 @@ async def add_server(request: AddServerRequest):
             server["status"] = "connection_failed"
             server["error"] = str(e)
         
+        # Reset agent so it reloads tools from all servers
+        global agent_instance
+        agent_instance = None
+        
         return {
             "success": True,
             "server": server
@@ -728,6 +732,9 @@ async def remove_server(server_id: str):
     manager = get_server_manager()
     
     if manager.remove_server(server_id):
+        # Reset agent so it reloads tools from remaining servers
+        global agent_instance
+        agent_instance = None
         return {"success": True, "message": f"Server '{server_id}' removed"}
     else:
         raise HTTPException(status_code=404, detail=f"Server '{server_id}' not found")
@@ -986,24 +993,36 @@ async def delete_chat(chat_id: str):
 import requests as http_requests  # Rename to avoid conflict
 
 class ConversationalAgent:
-    """AI Agent that uses MCP tools via Mistral API for conversational interactions."""
+    """AI Agent that uses MCP tools via Mistral API for conversational interactions.
     
-    def __init__(self, mcp_client: MCPSSEClient, mistral_api_key: str, model: str = "mistral-large-latest"):
-        self.mcp_client = mcp_client
+    Supports multiple MCP servers - gathers tools from ALL configured servers
+    and routes tool calls to the correct server.
+    """
+    
+    def __init__(self, server_manager: MCPServerManager, mistral_api_key: str, model: str = "mistral-large-latest"):
+        self.server_manager = server_manager
         self.mistral_api_key = mistral_api_key
         self.model = model
         self.mistral_url = "https://api.mistral.ai/v1/chat/completions"
-        self.tools = self._convert_mcp_tools_to_mistral()
+        # tool_name -> server_id mapping for routing
+        self.tool_server_map: Dict[str, str] = {}
+        self.tools = self._load_all_tools()
     
-    def _convert_mcp_tools_to_mistral(self) -> List[Dict[str, Any]]:
-        """Convert MCP tool definitions to Mistral function-calling format."""
-        mcp_tools = self.mcp_client.list_tools()
+    def _load_all_tools(self) -> List[Dict[str, Any]]:
+        """Load tools from ALL configured MCP servers and build routing map."""
+        all_mcp_tools = self.server_manager.get_all_tools()
         mistral_tools = []
+        self.tool_server_map.clear()
         
-        for tool in mcp_tools:
+        for tool in all_mcp_tools:
             name = tool.get("name")
             if not name:
                 continue
+            
+            # Store which server owns this tool
+            server_id = tool.get("server_id")
+            if server_id:
+                self.tool_server_map[name] = server_id
             
             schema = tool.get("inputSchema") or tool.get("input_schema") or {
                 "type": "object",
@@ -1020,7 +1039,34 @@ class ConversationalAgent:
                 }
             })
         
+        print(f"🔧 Loaded {len(mistral_tools)} tools from {len(set(self.tool_server_map.values()))} server(s): {list(self.tool_server_map.items())}")
         return mistral_tools
+    
+    def reload_tools(self):
+        """Reload tools from all servers (call after server changes)."""
+        self.tools = self._load_all_tools()
+    
+    def _build_system_prompt(self) -> str:
+        """Build a dynamic system prompt based on available servers and tools."""
+        server_descriptions = []
+        for sid, config in self.server_manager.server_configs.items():
+            name = config.get("name", sid)
+            # Gather tool names for this server
+            tools_for_server = [t for t, s in self.tool_server_map.items() if s == sid]
+            if tools_for_server:
+                server_descriptions.append(f"- {name}: tools [{', '.join(tools_for_server)}]")
+        
+        servers_info = "\n".join(server_descriptions) if server_descriptions else "No servers connected."
+        
+        return (
+            "You are a helpful AI assistant with access to multiple data sources via MCP tools. "
+            "When users ask questions that can be answered using the available tools, "
+            "ALWAYS use the appropriate tool(s) to fetch real data instead of guessing or providing generic information. "
+            "Be conversational and helpful. After fetching data, provide a clear and insightful summary.\n\n"
+            f"Available data sources:\n{servers_info}\n\n"
+            "Important: If a user's question can potentially be answered by any of the available tools, "
+            "USE the tool. Do not respond with generic internet advice when you have tools available."
+        )
     
     def call_mistral(self, messages: List[Dict], tools: List = None, max_tokens: int = 4096) -> Dict:
         """Call Mistral API with messages and optional tools."""
@@ -1050,13 +1096,18 @@ class ConversationalAgent:
         return response.json()
     
     def execute_tool(self, tool_name: str, arguments: Dict) -> str:
-        """Execute an MCP tool and return the result."""
+        """Execute an MCP tool on the correct server and return the result."""
         available_tools = [t["function"]["name"] for t in self.tools]
         if tool_name not in available_tools:
             return json.dumps({"error": f"Tool '{tool_name}' not found"})
         
+        # Route to the correct server
+        server_id = self.tool_server_map.get(tool_name)
+        if not server_id:
+            return json.dumps({"error": f"No server found for tool '{tool_name}'"})
+        
         try:
-            result = self.mcp_client.call_tool(tool_name, arguments or {})
+            result = self.server_manager.call_tool(server_id, tool_name, arguments or {})
             return result if isinstance(result, str) else json.dumps(result)
         except Exception as e:
             return json.dumps({"error": str(e)})
@@ -1069,12 +1120,7 @@ class ConversationalAgent:
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "You are a helpful AI assistant with access to Yahoo Finance tools. "
-                    "When users ask about stocks, financial data, or market information, "
-                    "use the available tools to fetch real data. Be conversational and helpful. "
-                    "After fetching data, provide a clear and insightful summary."
-                )
+                "content": self._build_system_prompt()
             }
         ]
         
@@ -1183,13 +1229,13 @@ class ConversationalAgent:
 agent_instance: Optional[ConversationalAgent] = None
 
 def get_agent() -> ConversationalAgent:
-    """Get or create the conversational agent."""
+    """Get or create the conversational agent using ALL configured MCP servers."""
     global agent_instance
     if agent_instance is None:
         if not MISTRAL_API_KEY:
             raise HTTPException(status_code=500, detail="MISTRAL_API_KEY not configured")
-        client = get_mcp_client()
-        agent_instance = ConversationalAgent(client, MISTRAL_API_KEY)
+        manager = get_server_manager()
+        agent_instance = ConversationalAgent(manager, MISTRAL_API_KEY)
     return agent_instance
 
 
@@ -1318,11 +1364,7 @@ async def chat_stream(request: ChatRequest):
             messages = [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a helpful AI assistant with access to Yahoo Finance tools. "
-                        "When users ask about stocks, financial data, or market information, "
-                        "use the available tools to fetch real data. Be conversational and helpful."
-                    )
+                    "content": agent._build_system_prompt()
                 }
             ]
             
